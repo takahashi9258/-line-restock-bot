@@ -1,0 +1,32 @@
+name: Store connectivity test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check store responses
+        shell: bash
+        run: |
+          user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1'
+          check() {
+            name="$1"
+            url="$2"
+            result="$(curl --location --max-time 15 --silent --show-error --output /dev/null --write-out '%{http_code} %{url_effective}' --user-agent "$user_agent" "$url" || true)"
+            printf '%s: %s\n' "$name" "$result"
+          }
+
+          check 'AEON' 'https://aeonretail.com/'
+          check 'AmiAmi' 'https://www.amiami.jp/'
+          check 'Joshin' 'https://joshinweb.jp/'
+          check 'ToysRUs' 'https://www.toysrus.co.jp/'
+          check 'Yodobashi' 'https://www.yodobashi.com/category/141001/141651/141662/'
+          check 'BicCamera' 'https://www.biccamera.com/bc/category/001/220/070/005/'
+          check 'RakutenBooks' 'https://books.rakuten.co.jp/event/game/card/entry/'
+          check 'AmazonJP' 'https://www.amazon.co.jp/s?k=%E3%83%9D%E3%82%B1%E3%83%A2%E3%83%B3%E3%82%AB%E3%83%BC%E3%83%89'
