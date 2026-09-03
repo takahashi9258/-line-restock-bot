@@ -1,5 +1,4 @@
 Flask
-line-bot-sdk
 gunicorn
 requests
 beautifulsoup4

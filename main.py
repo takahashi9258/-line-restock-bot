@@ -1,74 +1,30 @@
 import monitor
 import os
 
-from flask import Flask, request, abort
-from linebot.v3 import WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import (
-    ApiClient,
-    Configuration,
-    MessagingApi,
-    ReplyMessageRequest,
-    TextMessage,
-)
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from flask import Flask, jsonify
 
 
 app = Flask(__name__)
 
-channel_access_token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-channel_secret = os.environ.get("LINE_CHANNEL_SECRET")
-
-if not channel_access_token or not channel_secret:
-    raise RuntimeError(
-        "LINE_CHANNEL_ACCESS_TOKEN または LINE_CHANNEL_SECRET が設定されていません"
-    )
-
-configuration = Configuration(access_token=channel_access_token)
-handler = WebhookHandler(channel_secret)
-
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return "LINE bot is running", 200
+    return "AEON Discord monitor is running", 200
 
 
-@app.route("/callback", methods=["POST"])
-def callback():
-    signature = request.headers.get("X-Line-Signature")
-
-    if not signature:
-        abort(400)
-
-    body = request.get_data(as_text=True)
-
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-
-    return "OK", 200
-
-
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_message(event):
-    received_text = event.message.text
-
-    reply_text = (
-        "BOTは正常に動いています！\n"
-        f"受信したメッセージ：{received_text}"
-    )
-
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)],
-            )
-        )
-        
+@app.route("/status", methods=["GET"])
+def status():
+    with monitor.state_lock:
+        public_state = {
+            "started_at": monitor.state["started_at"],
+            "last_check_at": monitor.state["last_check_at"],
+            "last_success_at": monitor.state["last_success_at"],
+            "waiting": monitor.state["waiting"],
+            "initialized": monitor.state["initialized"],
+            "known_products": len(monitor.state["known_products"]),
+            "last_error": monitor.state["last_error"],
+        }
+    return jsonify(public_state)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,9 @@ import os
 import re
 import threading
 import time
-from urllib.parse import urljoin
+from datetime import datetime, timezone
+from urllib.parse import quote_plus, urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -11,10 +13,11 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-CHECK_INTERVAL_SECONDS = max(15, int(os.environ.get("CHECK_INTERVAL_SECONDS", "15")))
-PRODUCT_SCAN_SECONDS = max(30, int(os.environ.get("PRODUCT_SCAN_SECONDS", "60")))
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+CHECK_INTERVAL_SECONDS = max(60, int(os.environ.get("CHECK_INTERVAL_SECONDS", "60")))
+PRODUCT_SCAN_SECONDS = max(60, int(os.environ.get("PRODUCT_SCAN_SECONDS", "60")))
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "12"))
+JAPAN_TZ = ZoneInfo("Asia/Tokyo")
 
 SEARCH_TERMS = {
     "ポケカ": ("ポケモンカードゲーム", "ポケモンカード"),
@@ -29,6 +32,24 @@ SEARCH_TERMS = {
 SEARCH_URL = "https://aeonretail.com/Form/Product/ProductList.aspx"
 AEON_HOME_URL = "https://aeonretail.com/"
 MAX_SEARCH_PAGES = 10
+
+EXTRA_STORES = {
+    "あみあみ": {
+        "home": "https://www.amiami.jp/",
+        "search": "https://www.amiami.jp/top/search/list?s_keywords={term}",
+        "product_paths": ("/top/detail/",),
+    },
+    "Joshin web": {
+        "home": "https://joshinweb.jp/",
+        "search": "https://joshinweb.jp/srhzs.html?KEYWORD={term}",
+        "product_paths": ("/toy/", "/game/"),
+    },
+    "トイザらスオンライン": {
+        "home": "https://www.toysrus.co.jp/",
+        "search": "https://www.toysrus.co.jp/ja-jp/search/?q={term}",
+        "product_paths": ("/ja-jp/",),
+    },
+}
 
 CARD_PATTERNS = {
     "ポケカ": re.compile(r"ポケモンカード(?:ゲーム)?", re.IGNORECASE),
@@ -57,6 +78,15 @@ SOLD_OUT_MARKERS = (
     "販売を終了しました",
     "販売期間外です",
     "予約受付を終了",
+    "在庫なし",
+    "在庫切れ",
+    "品切れ",
+    "売り切れ",
+    "完売",
+    "販売終了",
+    "予約受付終了",
+    "ご注文いただけません",
+    "入荷待ち",
 )
 BUY_MARKERS = (
     "カートに入れる",
@@ -64,6 +94,10 @@ BUY_MARKERS = (
     "予約する",
     "予約購入する",
     "お申し込み",
+    "購入する",
+    "予約受付中",
+    "ショッピングカートに入れる",
+    "add to cart",
 )
 
 http = requests.Session()
@@ -104,18 +138,50 @@ def is_waiting_page(response, text):
     )
 
 
-def line_broadcast(message):
+def discord_notify(title, description, url, color):
+    detected_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     response = requests.post(
-        "https://api.line.me/v2/bot/message/broadcast",
-        headers={
-            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
-            "Content-Type": "application/json",
+        DISCORD_WEBHOOK_URL,
+        json={
+            "username": "カード入荷通知Bot",
+            "allowed_mentions": {"parse": []},
+            "embeds": [
+                {
+                    "title": title[:256],
+                    "description": description[:4096],
+                    "url": url,
+                    "color": color,
+                    "fields": [
+                        {
+                            "name": "検知時刻",
+                            "value": datetime.now(JAPAN_TZ).strftime(
+                                "%Y/%m/%d %H:%M:%S"
+                            ),
+                            "inline": True,
+                        }
+                    ],
+                    "timestamp": detected_at,
+                    "footer": {"text": "カード通販4店舗 60秒監視"},
+                }
+            ],
         },
-        json={"messages": [{"type": "text", "text": message[:5000]}]},
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
-    logger.info("LINE notification sent")
+    logger.info("Discord notification sent")
+
+
+def extract_price(text):
+    patterns = (
+        r"税込[：:\s]*([0-9,]+(?:\.[0-9]+)?)円",
+        r"販売価格[：:\s]*([0-9,]+(?:\.[0-9]+)?)円",
+        r"([0-9,]+(?:\.[0-9]+)?)円\s*\(税込\)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return f"税込 {match.group(1)}円"
+    return "価格は商品ページで確認"
 
 
 def product_title(anchor):
@@ -137,6 +203,31 @@ def extract_products(html, category):
         if not href or not title or not pattern.search(title):
             continue
         url = urljoin(AEON_HOME_URL, href).split("?")[0]
+        if url not in seen:
+            seen.add(url)
+            products.append((title, url))
+    return products
+
+
+def extract_store_products(html, category, store):
+    soup = BeautifulSoup(html, "html.parser")
+    pattern = CARD_PATTERNS[category]
+    expected_host = urlparse(store["home"]).netloc
+    products = []
+    seen = set()
+    for anchor in soup.select("a[href]"):
+        href = anchor.get("href")
+        title = product_title(anchor)
+        if not href or not title or not pattern.search(title):
+            continue
+        url = urljoin(store["home"], href).split("#")[0]
+        parsed = urlparse(url)
+        if parsed.netloc != expected_host:
+            continue
+        if not any(path in parsed.path for path in store["product_paths"]):
+            continue
+        if any(word in parsed.path.lower() for word in ("search", "category", "ranking")):
+            continue
         if url not in seen:
             seen.add(url)
             products.append((title, url))
@@ -178,6 +269,20 @@ def search_all_products(category, term):
     return [(title, url) for url, title in products.items()], False
 
 
+def search_store_products(store, category, term):
+    url = store["search"].format(term=quote_plus(term))
+    response = http.get(
+        url,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+    text = compact_text(response.text)
+    if is_waiting_page(response, text):
+        return [], True
+    return extract_store_products(response.text, category, store), False
+
+
 def fetch(url):
     response = http.get(url, timeout=REQUEST_TIMEOUT_SECONDS, allow_redirects=True)
     response.raise_for_status()
@@ -187,17 +292,19 @@ def fetch(url):
 def check_product(url):
     response, text = fetch(url)
     if is_waiting_page(response, text):
-        return None, True
-    sold_out = any(marker in text for marker in SOLD_OUT_MARKERS)
-    purchasable = any(marker in text for marker in BUY_MARKERS)
-    return purchasable and not sold_out, False
+        return None, True, None
+    lowered = text.lower()
+    sold_out = any(marker.lower() in lowered for marker in SOLD_OUT_MARKERS)
+    purchasable = any(marker.lower() in lowered for marker in BUY_MARKERS)
+    return purchasable and not sold_out, False, extract_price(text)
 
 
 def notify_waiting(url=AEON_HOME_URL):
-    line_broadcast(
-        "🚨 イオンスタイルオンラインで待機が発生しました\n"
-        "販売開始の可能性があります。すぐに確認してください。\n"
-        f"{url}"
+    discord_notify(
+        "🚨 イオンスタイルオンラインで待機発生",
+        "販売開始の可能性があります。すぐに確認してください。",
+        url,
+        0xED4245,
     )
     with state_lock:
         state["waiting"] = True
@@ -241,15 +348,36 @@ def run_cycle():
                     notify_waiting()
                     return
                 for title, url in products:
-                    found_products[(category, url)] = title
+                    found_products[("イオンスタイルオンライン", category, url)] = title
             except requests.RequestException as exc:
                 logger.warning("Search failed for %s/%s: %s", category, term, exc)
 
+    for store_name, store in EXTRA_STORES.items():
+        for category, terms in SEARCH_TERMS.items():
+            for term in terms:
+                try:
+                    products, search_waiting = search_store_products(
+                        store, category, term
+                    )
+                    if search_waiting:
+                        logger.warning("Waiting page detected at %s", store_name)
+                        continue
+                    for title, url in products:
+                        found_products[(store_name, category, url)] = title
+                except requests.RequestException as exc:
+                    logger.warning(
+                        "Search failed for %s/%s/%s: %s",
+                        store_name,
+                        category,
+                        term,
+                        exc,
+                    )
+
     with state_lock:
         initialized = state["initialized"]
-    for (category, url), title in found_products.items():
+    for (store_name, category, url), title in found_products.items():
         try:
-            available, product_waiting = check_product(url)
+            available, product_waiting, price = check_product(url)
             if product_waiting:
                 notify_waiting(url)
                 return
@@ -257,7 +385,12 @@ def run_cycle():
                 previous = state["known_products"].get(url)
                 state["known_products"][url] = bool(available)
             if initialized and available and previous is not True:
-                line_broadcast(f"🔥【販売開始】{category}\n{title[:300]}\n{url}")
+                discord_notify(
+                    f"🔥 販売開始｜{store_name}",
+                    f"**{category}**\n{title[:300]}\n\n💴 {price}\n\n🔗 [商品ページを開く]({url})",
+                    url,
+                    0x57F287,
+                )
         except requests.RequestException as exc:
             logger.warning("Product check failed for %s: %s", url, exc)
 
@@ -287,5 +420,5 @@ def loop():
         time.sleep(max(1, CHECK_INTERVAL_SECONDS - (time.monotonic() - started)))
 
 
-if CHANNEL_ACCESS_TOKEN and os.environ.get("MONITOR_ENABLED", "true").lower() == "true":
+if DISCORD_WEBHOOK_URL and os.environ.get("MONITOR_ENABLED", "true").lower() == "true":
     threading.Thread(target=loop, name="aeon-monitor", daemon=True).start()
